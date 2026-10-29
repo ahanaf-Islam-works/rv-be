@@ -2,6 +2,7 @@ from typing import Any
 
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import BaseUserManager
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
 from config.models import SoftDeleteManager
@@ -32,7 +33,8 @@ class UserManager(SoftDeleteManager, BaseUserManager):
         if not email:
             raise ValueError(_("The email must be set"))
 
-        email = self.normalize_email(email)
+        # Emails are treated case-insensitively throughout the project.
+        email = self.normalize_email(email).lower()
         username = self.model.normalize_username(username)
 
         user = self.model(username=username, email=email, **extra_fields)
@@ -62,6 +64,8 @@ class UserManager(SoftDeleteManager, BaseUserManager):
         extra_fields.setdefault("is_staff", True)
         extra_fields.setdefault("is_superuser", True)
         extra_fields.setdefault("is_active", True)
+        # Admins are created by the operator; don't lock them out of login.
+        extra_fields.setdefault("email_verified_at", timezone.now())
 
         if extra_fields.get("is_staff") is not True:
             raise ValueError(_("Superuser must have is_staff=True."))

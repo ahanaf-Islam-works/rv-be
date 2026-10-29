@@ -1,28 +1,77 @@
 # JWT Auth + Subscription Tiers (Basic / Platinum / Diamond) for Django REST
 
-Stack: Django + DRF + `djangorestframework-simplejwt`, built on your custom `User`
-(UUID pk, soft delete) and your `config.models` mixins.
+Stack: Django 6.1 + DRF + `djangorestframework-simplejwt`, on the custom
+`users.User` (UUID primary key, soft delete) and the `config.models` mixins.
+
+> **This repository is the reference implementation.** The code snippets below
+> are excerpts to explain the design; when they differ, the files in the repo
+> win. The frontend contract lives in [`auth-api.md`](./auth-api.md).
 
 ## 0. The design in one paragraph
 
-- **Authentication** (who are you?) = short-lived JWT access token (15 min) + rotating, blacklistable refresh token (7 days).
-- **Authorization by plan** (what can you use?) = a `Plan` table (basic/platinum/diamond) and a `Subscription` table linking a user to a plan with a status and billing period. A user has **many** subscriptions over time (history) but only **one live** one (enforced by a DB constraint).
-- The tier is **embedded in the JWT as a claim for UI convenience**, but permission checks **read the DB**, so an upgrade, downgrade, or expiry takes effect immediately instead of when the token expires.
-- Every new user gets a **Basic** subscription at registration. Paid upgrades should be driven by **payment-provider webhooks** (Stripe etc.), never by a client calling "upgrade me".
+- **Authentication** (who are you?) = short-lived JWT access token (15 min) +
+  rotating, blacklistable refresh token (7 days) stored in an `HttpOnly` cookie.
+- **Authorization by plan** (what can you use?) = a `Plan` catalog
+  (`basic` / `platinum` / `diamond`) and a `Subscription` table linking a user to
+  a plan with a status and billing period. A user has **many** subscriptions over
+  time (history) but only **one live** one (enforced by a partial unique
+  constraint).
+- The tier is **embedded in the access token as a claim for UI convenience**, but
+  permission checks **read the database**, so an upgrade, downgrade or expiry
+  takes effect on the next request instead of when the token expires.
+- Every new user gets a **Basic** subscription at registration. Paid upgrades
+  must be driven by **payment-provider webhooks**, never by a client calling
+  "upgrade me". There is intentionally no client-facing upgrade endpoint.
 
 Project layout:
 
 ```
-config/        settings, urls, models (mixins)
-users/         User model, UserManager (services.py), auth serializers + views
-subscriptions/ Plan, Subscription, services, permissions, views
+config/
+  settings.py      env-driven settings, JWT, cookies, throttles, security
+  exceptions.py    consistent {detail, code[, errors]} error envelope
+  urls.py          /api/v1/auth/ and /api/v1/subscriptions/
+  models.py        time-stamped / audited / soft-delete mixins
+users/
+  models.py        User (UUID pk, soft delete, email_verified_at, tier properties)
+  services.py      UserManager (soft-delete aware, lower-cases emails)
+  serializers.py   register / login / refresh / me / password serializers
+  views.py         register, verify, login, refresh, logout, me, passwords
+  tokens.py        email verification + reset tokens, revoke-all-refresh
+  cookies.py       refresh-cookie helpers
+  exceptions.py    EmailNotVerified (403)
+subscriptions/
+  models.py        Tier, TIER_RANK, Plan, Subscription
+  services.py      get_live_subscription, get_user_tier, change_plan, expiry
+  permissions.py   tier_required() / IsPlatinumOrHigher / IsDiamond
+  serializers.py   PlanSerializer, SubscriptionSerializer
+  views.py         plans, my subscription, demo gated endpoints
+  plan_defaults.py shared seed data for Basic / Platinum / Diamond
+  management/commands/seed_plans.py, expire_subscriptions.py
 ```
 
----
+### 0.1 Error envelope
 
-## 0.1 The auth flow at a glance
+`config.exceptions.api_exception_handler` gives every error a stable,
+machine-readable `code`:
 
-This is the final flow once sections 12 (cookie refresh token) and 13 (email verification + password reset) are applied.
+```json
+{"detail": "Please verify your email before logging in.", "code": "email_not_verified"}
+```
+
+Validation errors also include per-field messages:
+
+```json
+{
+  "detail": "Validation failed.",
+  "code": "invalid",
+  "errors": {"email": ["A user with this email already exists."]}
+}
+```
+
+Clients branch on `code`, never on `detail` (it may change or be translated).
+The full list is in `auth-api.md`.
+
+### 0.2 The auth flow at a glance
 
 ```mermaid
 sequenceDiagram
@@ -33,15 +82,16 @@ sequenceDiagram
     participant M as Email
 
     Note over C,M: A. Sign up and verify
-    C->>A: POST /auth/register/
+    C->>A: POST /api/v1/auth/register/
     A->>DB: create User + Basic subscription
     A->>M: verification link (signed token, 24h)
-    C->>A: POST /auth/verify-email/ {token}
+    C->>A: POST /api/v1/auth/verify-email/ {token}
     A->>DB: set email_verified_at
 
     Note over C,M: B. Login
-    C->>A: POST /auth/login/ {username, password}
-    A-->>C: {access} in body + refresh in HttpOnly cookie
+    C->>A: POST /api/v1/auth/login/ {username, password}
+    A-->>C: 200 {access} in body + refresh in HttpOnly cookie
+    Note right of A: 403 email_not_verified until verified
 
     Note over C,M: C. Use the API
     C->>A: GET /api/... (Authorization: Bearer access)
@@ -49,48 +99,84 @@ sequenceDiagram
     A-->>C: 200 OK / 401 expired / 403 wrong tier
 
     Note over C,M: D. Silent refresh (access expired)
-    C->>A: POST /auth/token/refresh/ (cookie sent automatically)
-    A->>DB: blacklist old refresh, issue new pair
-    A-->>C: {access} + new refresh cookie
+    C->>A: POST /api/v1/auth/token/refresh/ (cookie sent automatically)
+    A->>DB: blacklist old refresh, issue a new pair
+    A-->>C: 200 {access} + new refresh cookie
 
     Note over C,M: E. Logout
-    C->>A: POST /auth/logout/
+    C->>A: POST /api/v1/auth/logout/
     A->>DB: blacklist refresh token
-    A-->>C: cookie deleted
+    A-->>C: 204 + cookie deleted
 ```
 
 Step by step:
 
-1. **Register**: creates the user (unverified), gives them the free Basic plan in the same transaction, and emails a signed verification link.
-2. **Verify email**: the frontend page behind the link posts the token; the server checks signature and age (24h) and stamps `email_verified_at`.
-3. **Login**: username + password are checked. Unverified users get `403 email_not_verified`. On success the server returns a 15-minute **access token** in the JSON body and sets the 7-day **refresh token** in an `HttpOnly` cookie that JavaScript can never read.
-4. **Call the API**: the client sends `Authorization: Bearer <access>`. The server validates the signature and expiry, loads the user (deleted/inactive users are rejected), and permission classes check the live tier in the DB.
-5. **Refresh**: when the access token expires (`401`), the client calls `/token/refresh/`. The browser attaches the cookie itself. The old refresh token is blacklisted and a new one is issued (rotation). If an attacker replays a stolen, already-used refresh token it fails.
-6. **Logout**: the refresh token is blacklisted and the cookie is cleared. The short-lived access token simply expires on its own (that is the trade-off of stateless JWTs, and why it is only 15 minutes).
-7. **Forgot password**: the user requests a reset email (the response is always identical, so attackers can't discover which emails exist), opens the link, submits a new password, and **every refresh token for that user is revoked**.
+1. **Register**: creates the user (unverified), gives them the free Basic plan in
+   the same transaction, and emails a signed verification link (sent only after
+   the transaction commits).
+2. **Verify email**: the frontend page behind the link posts the token; the
+   server checks the signature and age (24 h) and stamps `email_verified_at`.
+   Changing the account email invalidates existing links.
+3. **Login**: username + password are checked first. Unverified users get
+   `403` with `code: "email_not_verified"` (not `401`, so clients do not start a
+   refresh loop). On success the body contains a 15-minute **access token** and
+   the 7-day **refresh token** is set in an `HttpOnly` cookie JavaScript cannot
+   read.
+4. **Call the API**: the client sends `Authorization: Bearer <access>`. The
+   server validates signature/expiry, loads the user through the soft-delete
+   manager (deleted/inactive users are rejected), and permission classes check
+   the live tier in the database.
+5. **Refresh**: when the access token expires (`401`), the client calls
+   `/token/refresh/`. The browser attaches the cookie itself. The old refresh
+   token is blacklisted and a new one is issued (rotation). Replaying an
+   already-used refresh token fails.
+6. **Logout**: the refresh token is blacklisted and the cookie is cleared. The
+   short-lived access token simply expires on its own (always ≤ 15 min). This is
+   the trade-off of stateless JWTs and the reason the access lifetime is short.
+7. **Forgot password**: the response is always identical (no account
+   enumeration), the link expires in 1 hour, is single-use (it dies when the
+   password hash changes), and **every refresh token for that user is revoked**.
+8. **Change password**: requires the old password, revokes every refresh token
+   and clears the cookie. The current access token still lives for at most
+   15 minutes; the client must discard it immediately.
 
 Token cheat sheet:
 
-| Token                | Lifetime         | Where it lives                                  | Sent how                       | Revocable                      |
-| -------------------- | ---------------- | ----------------------------------------------- | ------------------------------ | ------------------------------ |
-| Access JWT           | 15 min           | JS memory (not localStorage)                    | `Authorization: Bearer`        | No, it expires fast            |
-| Refresh JWT          | 7 days, rotating | `HttpOnly; Secure` cookie, path `/api/v1/auth/` | Browser attaches automatically | Yes, blacklist table           |
-| Email verify token   | 24 h             | Link in email                                   | Request body                   | Dies if the email changes      |
-| Password reset token | 1 h, one use     | Link in email                                   | Request body                   | Dies once the password changes |
+| Token                | Lifetime         | Where it lives                                  | Sent how                       | Revocable                       |
+| -------------------- | ---------------- | ----------------------------------------------- | ------------------------------ | ------------------------------- |
+| Access JWT           | 15 min           | JS memory (never `localStorage`)                | `Authorization: Bearer`        | No; expires fast                |
+| Refresh JWT          | 7 days, rotating | `HttpOnly; Secure` cookie, path `/api/v1/auth/` | Browser attaches automatically | Yes; blacklist table            |
+| Email verify token   | 24 h             | Link in email                                   | Request body                   | Dies if the email changes       |
+| Password reset token | 1 h, single use  | Link in email                                   | Request body                   | Dies once the password changes  |
 
 ---
 
 ## 1. Install
 
 ```bash
+# with uv (the repo already has a lockfile)
+uv sync
+
+# or with pip
 pip install djangorestframework djangorestframework-simplejwt
-python manage.py startapp subscriptions
 ```
 
-## 2. Settings changes (`config/settings.py`)
+`python manage.py startapp subscriptions` is not needed: the app exists.
+
+## 2. Settings (`config/settings.py`)
+
+The important parts (the file is the source of truth):
 
 ```python
-from datetime import timedelta
+DEBUG = env("DEBUG")
+
+# No insecure fallback when DEBUG=False: the process refuses to start.
+SECRET_KEY = env("SECRET_KEY", default="django-insecure-dev-only-key" if DEBUG else None)
+if not SECRET_KEY:
+    raise ImproperlyConfigured("SECRET_KEY must be set when DEBUG=False")
+
+# Dedicated JWT key; rotating it invalidates every outstanding token.
+JWT_SIGNING_KEY = env("JWT_SIGNING_KEY", default=SECRET_KEY)
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -99,19 +185,14 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    # third party
     "rest_framework",
     "rest_framework_simplejwt",
-    "rest_framework_simplejwt.token_blacklist",  # enables logout / refresh revocation
-    # local
+    "rest_framework_simplejwt.token_blacklist",  # logout / refresh revocation
     "users",
     "subscriptions",
 ]
 
-AUTH_USER_MODEL = "users.User"   # MUST be set before your first migrate
-
-# Remove the insecure default SECRET_KEY fallback outside local dev:
-# SECRET_KEY = env("SECRET_KEY")   # no default -> app refuses to start without it
+AUTH_USER_MODEL = "users.User"  # MUST be set before the first migrate
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
@@ -130,189 +211,82 @@ REST_FRAMEWORK = {
         "user": "2000/hour",
         "login": "5/min",       # brute-force protection
         "register": "10/hour",
+        "email": "5/hour",      # verification / password-reset emails
+        "refresh": "60/hour",   # silent refresh + retry storms
     },
+    "EXCEPTION_HANDLER": "config.exceptions.api_exception_handler",
 }
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
-    "ROTATE_REFRESH_TOKENS": True,        # every refresh issues a new refresh token
-    "BLACKLIST_AFTER_ROTATION": True,     # old refresh token becomes unusable (theft detection)
+    "ROTATE_REFRESH_TOKENS": True,       # every refresh issues a new refresh token
+    "BLACKLIST_AFTER_ROTATION": True,    # old refresh token becomes unusable
     "UPDATE_LAST_LOGIN": True,
     "ALGORITHM": "HS256",
-    "SIGNING_KEY": SECRET_KEY,            # or a dedicated JWT_SIGNING_KEY env var
+    "SIGNING_KEY": JWT_SIGNING_KEY,
     "AUTH_HEADER_TYPES": ("Bearer",),
-    "USER_ID_FIELD": "id",                # your UUID pk (simplejwt stringifies it)
+    "USER_ID_FIELD": "id",               # User UUID pk (simplejwt stringifies it)
     "USER_ID_CLAIM": "user_id",
+    "TOKEN_TYPE_CLAIM": "token_type",
 }
+
+AUTH_COOKIE_REFRESH = "refresh_token"
+AUTH_COOKIE_SECURE = not DEBUG           # True in production (HTTPS only)
+AUTH_COOKIE_SAMESITE = "Lax"             # "None" only for a truly cross-site frontend
+AUTH_COOKIE_PATH = "/api/v1/auth/"       # not sent to the rest of the API
+AUTH_COOKIE_MAX_AGE = int(SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds())
+
+FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000").rstrip("/")
+EMAIL_VERIFY_MAX_AGE = 60 * 60 * 24      # 24 hours
+PASSWORD_RESET_TIMEOUT = 60 * 60         # 1 hour (Django's reset-token setting)
 ```
+
+Production security defaults (`SECURE_SSL_REDIRECT`, HSTS, secure session/CSRF
+cookies, `X_FRAME_OPTIONS = "DENY"`) are applied automatically when
+`DEBUG=False`; `TRUST_PROXY_HEADERS=True` enables
+`SECURE_PROXY_SSL_HEADER` behind a TLS-terminating proxy.
+
+Environment variables (start from `.env.example`):
+
+| Variable                | Default                  | Notes                                      |
+| ----------------------- | ------------------------ | ------------------------------------------ |
+| `SECRET_KEY`            | dev-only when `DEBUG`    | **required** when `DEBUG=False`            |
+| `JWT_SIGNING_KEY`       | `SECRET_KEY`             | dedicated key recommended                  |
+| `DEBUG`                 | `False`                  |                                            |
+| `ALLOWED_HOSTS`         | `[]`                     | comma-separated                            |
+| `DATABASE_URL`          | local SQLite             | Postgres in production                     |
+| `FRONTEND_URL`          | `http://localhost:3000`  | used to build email links                  |
+| `AUTH_COOKIE_SECURE`    | `not DEBUG`              | must be `True` with `SameSite=None`        |
+| `AUTH_COOKIE_SAMESITE`  | `Lax`                    | `None` requires HTTPS + CSRF defense      |
+| `EMAIL_BACKEND`         | console                  | use SMTP/transactional provider in prod    |
+| `DEFAULT_FROM_EMAIL`    | `webmaster@localhost`    |                                            |
 
 Notes:
 
-- simplejwt loads users with `User.objects`, which is your soft-delete-aware manager, so a soft-deleted user's tokens stop working immediately.
-- `is_active=False` users are also rejected by default.
-
----
+- simplejwt loads users through `User.objects`, the soft-delete-aware manager, so
+  a soft-deleted user's tokens stop working on the next request.
+- `is_active=False` users are rejected by authentication and by refresh.
+- `JWT_SIGNING_KEY` rotation invalidates all tokens at once; that is an
+  emergency lever, not a routine operation.
 
 ## 3. Models
 
-### `subscriptions/models.py`
+`users.User` uses a UUID primary key and adds verification state:
 
 ```python
-from django.conf import settings
-from django.db import models
-from django.db.models import Q
-from django.utils import timezone
-from django.utils.translation import gettext_lazy as _
-
-from config.models import BaseModel
-
-
-class Tier(models.TextChoices):
-    BASIC = "basic", _("Basic")
-    PLATINUM = "platinum", _("Platinum")
-    DIAMOND = "diamond", _("Diamond")
-
-
-# Single source of truth for ordering tiers (higher = more access).
-TIER_RANK = {Tier.BASIC: 1, Tier.PLATINUM: 2, Tier.DIAMOND: 3}
-
-
-class SubscriptionStatus(models.TextChoices):
-    TRIALING = "trialing", _("Trialing")
-    ACTIVE = "active", _("Active")
-    PAST_DUE = "past_due", _("Past due")      # payment failed, grace period
-    CANCELED = "canceled", _("Canceled")
-    EXPIRED = "expired", _("Expired")
-
-
-# Statuses that grant access. Used both in the DB constraint and in queries.
-LIVE_STATUSES = (
-    SubscriptionStatus.TRIALING,
-    SubscriptionStatus.ACTIVE,
-    SubscriptionStatus.PAST_DUE,
-)
-
-
-class BillingCycle(models.TextChoices):
-    MONTHLY = "monthly", _("Monthly")
-    YEARLY = "yearly", _("Yearly")
-
-
-class Plan(BaseModel):
-    """
-    Catalog entry. Three rows: basic, platinum, diamond.
-    Prices/limits live in data, not code, so you can change them without a deploy.
-    """
-
-    tier = models.CharField(
-        max_length=20, choices=Tier.choices, unique=True, verbose_name=_("Tier")
-    )
-    name = models.CharField(max_length=100, verbose_name=_("Name"))
-    description = models.TextField(blank=True, verbose_name=_("Description"))
-    price_monthly = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    price_yearly = models.DecimalField(max_digits=10, decimal_places=2, default=0)
-    currency = models.CharField(max_length=3, default="USD")
-
-    # Feature limits, e.g. {"max_projects": 3, "api_calls_per_day": 1000, "export": false}
-    limits = models.JSONField(default=dict, blank=True)
-
-    # ID of this plan in your payment provider (Stripe price/product id)
-    provider_price_id_monthly = models.CharField(max_length=255, blank=True)
-    provider_price_id_yearly = models.CharField(max_length=255, blank=True)
-
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        verbose_name = _("Plan")
-        verbose_name_plural = _("Plans")
-
-    def __str__(self):
-        return self.name
+class User(TimeStampedMixin, SoftDeleteMixin, AbstractBaseUser, PermissionsMixin):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    username = models.CharField(max_length=150, unique=True)
+    email = models.EmailField(unique=True)
+    email_verified_at = models.DateTimeField(null=True, blank=True)
+    ...
+    objects = UserManager()
 
     @property
-    def rank(self) -> int:
-        return TIER_RANK[self.tier]
+    def is_email_verified(self) -> bool:
+        return self.email_verified_at is not None
 
-
-class Subscription(BaseModel):
-    """
-    A user's subscription period. History is preserved: changing plan closes the
-    old row and opens a new one. At most ONE live row per user (DB-enforced).
-    """
-
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="subscriptions",
-    )
-    plan = models.ForeignKey(
-        Plan, on_delete=models.PROTECT, related_name="subscriptions"
-    )
-    status = models.CharField(
-        max_length=20,
-        choices=SubscriptionStatus.choices,
-        default=SubscriptionStatus.ACTIVE,
-        db_index=True,
-    )
-    billing_cycle = models.CharField(
-        max_length=10, choices=BillingCycle.choices, default=BillingCycle.MONTHLY
-    )
-
-    started_at = models.DateTimeField(default=timezone.now)
-    current_period_start = models.DateTimeField(default=timezone.now)
-    # NULL = never expires (the free Basic plan)
-    current_period_end = models.DateTimeField(null=True, blank=True)
-    trial_ends_at = models.DateTimeField(null=True, blank=True)
-    cancel_at_period_end = models.BooleanField(default=False)
-    ended_at = models.DateTimeField(null=True, blank=True)
-
-    # Payment provider linkage (Stripe subscription/customer ids)
-    provider = models.CharField(max_length=30, blank=True)
-    provider_customer_id = models.CharField(max_length=255, blank=True)
-    provider_subscription_id = models.CharField(
-        max_length=255, blank=True, db_index=True
-    )
-
-    class Meta:
-        verbose_name = _("Subscription")
-        verbose_name_plural = _("Subscriptions")
-        ordering = ["-created_at"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["user"],
-                condition=Q(status__in=[s.value for s in LIVE_STATUSES])
-                & Q(deleted_at__isnull=True),
-                name="one_live_subscription_per_user",
-            ),
-        ]
-        indexes = [
-            models.Index(fields=["user", "status"], name="sub_user_status_idx"),
-            models.Index(fields=["current_period_end"], name="sub_period_end_idx"),
-        ]
-
-    def __str__(self):
-        return f"{self.user_id} -> {self.plan.tier} ({self.status})"
-
-    @property
-    def is_live(self) -> bool:
-        if self.status not in LIVE_STATUSES:
-            return False
-        return self.current_period_end is None or self.current_period_end > timezone.now()
-```
-
-Why this shape:
-
-- `Plan` is data, so pricing and limits change without a deploy.
-- `Subscription` keeps history (audit, refunds, analytics) instead of overwriting a `tier` column on the user.
-- The partial unique constraint makes "two active subscriptions at once" impossible, even under race conditions.
-- `PAST_DUE` is treated as live, which gives a grace period when a card fails; remove it from `LIVE_STATUSES` for a hard cutoff.
-
-### Convenience on `User` (`users/models.py`)
-
-Add these two members to your `User` class (import inside the method to avoid circular imports):
-
-```python
     @property
     def tier(self) -> str:
         from subscriptions.services import get_user_tier
@@ -324,436 +298,247 @@ Add these two members to your `User` class (import inside the method to avoid ci
         return get_live_subscription(self)
 ```
 
----
+`UserManager.create_superuser` sets `email_verified_at=timezone.now()` so admins
+created with `createsuperuser` are not locked out. `UserManager` lower-cases
+emails, so `Sam@Example.com` and `sam@example.com` cannot both exist.
 
-## 4. Services (business logic, not in views)
-
-### `subscriptions/services.py`
+`subscriptions/models.py` defines the catalog and history:
 
 ```python
-from datetime import timedelta
+class Tier(models.TextChoices):
+    BASIC = "basic", _("Basic")
+    PLATINUM = "platinum", _("Platinum")
+    DIAMOND = "diamond", _("Diamond")
 
-from django.db import transaction
-from django.db.models import Q
-from django.utils import timezone
+TIER_RANK = {Tier.BASIC: 1, Tier.PLATINUM: 2, Tier.DIAMOND: 3}
 
-from .models import (
-    LIVE_STATUSES,
-    BillingCycle,
-    Plan,
-    Subscription,
-    SubscriptionStatus,
-    Tier,
+def tier_rank(tier: str) -> int:
+    try:
+        return TIER_RANK[Tier(tier)]
+    except (KeyError, ValueError):
+        return 0
+
+LIVE_STATUSES = (
+    SubscriptionStatus.TRIALING,
+    SubscriptionStatus.ACTIVE,
+    SubscriptionStatus.PAST_DUE,  # grace period while a payment retries
 )
+```
 
+`Plan` is a data row (prices, JSON `limits`, provider price ids), so pricing and
+feature limits change without a deploy. `Subscription` keeps history; changing
+plans closes the old row and opens a new one. The key invariant is enforced by
+the database, not just by application code:
+
+```python
+constraints = (
+    models.UniqueConstraint(
+        fields=["user"],
+        condition=Q(status__in=[s.value for s in LIVE_STATUSES])
+        & Q(deleted_at__isnull=True),
+        name="one_live_subscription_per_user",
+    ),
+)
+```
+
+`Subscription.is_live` also treats a `TRIALING` row as expired once
+`trial_ends_at` has passed, even if `current_period_end` is still in the future.
+
+Why this shape:
+
+- `Plan` as data means pricing/limits changes do not need a deploy.
+- `Subscription` history supports audits, refunds and analytics.
+- The partial unique constraint makes "two active subscriptions at once"
+  impossible, even under race conditions.
+- `PAST_DUE` grants a grace period; remove it from `LIVE_STATUSES` for a hard
+  cutoff.
+
+## 4. Subscription services
+
+Business logic lives in `subscriptions/services.py`, never in views:
+
+```python
+def live_subscriptions_q(now=None) -> Q:
+    """Status, period-end and trial-end aware."""
+    ...
 
 def get_live_subscription(user) -> Subscription | None:
-    now = timezone.now()
-    return (
-        Subscription.objects.select_related("plan")
-        .filter(user=user, status__in=LIVE_STATUSES)
-        .filter(Q(current_period_end__isnull=True) | Q(current_period_end__gt=now))
-        .order_by("-created_at")
-        .first()
-    )
-
+    ...
 
 def get_user_tier(user) -> str:
     sub = get_live_subscription(user)
     return sub.plan.tier if sub else Tier.BASIC
 
-
 @transaction.atomic
 def assign_default_plan(user) -> Subscription:
-    """Called at registration: every user starts on Basic (free, never expires)."""
-    plan = Plan.objects.get(tier=Tier.BASIC)
-    return Subscription.objects.create(
-        user=user,
-        plan=plan,
-        status=SubscriptionStatus.ACTIVE,
-        current_period_end=None,
-    )
-
+    """Idempotent: returns the existing live row if there is one."""
 
 @transaction.atomic
-def change_plan(
-    user,
-    tier: str,
-    billing_cycle: str = BillingCycle.MONTHLY,
-    *,
-    provider: str = "",
-    provider_customer_id: str = "",
-    provider_subscription_id: str = "",
-) -> Subscription:
-    """
-    Close the current live subscription and open a new one on `tier`.
-    Call this from your payment webhook handler after a successful payment,
-    NOT directly from a client-facing endpoint.
-    """
-    plan = Plan.objects.get(tier=tier, is_active=True)
-    now = timezone.now()
+def change_plan(user, tier, billing_cycle=BillingCycle.MONTHLY, *,
+                provider="", provider_customer_id="", provider_subscription_id=""):
+    """Close live rows, then open one on `tier`. Webhook-only."""
 
-    live = Subscription.objects.select_for_update().filter(
-        user=user, status__in=LIVE_STATUSES
-    )
-    live.update(status=SubscriptionStatus.CANCELED, ended_at=now)
-
-    if tier == Tier.BASIC:
-        period_end = None
-    elif billing_cycle == BillingCycle.YEARLY:
-        period_end = now + timedelta(days=365)
-    else:
-        period_end = now + timedelta(days=30)
-
-    return Subscription.objects.create(
-        user=user,
-        plan=plan,
-        status=SubscriptionStatus.ACTIVE,
-        billing_cycle=billing_cycle,
-        current_period_start=now,
-        current_period_end=period_end,
-        provider=provider,
-        provider_customer_id=provider_customer_id,
-        provider_subscription_id=provider_subscription_id,
-    )
-
-
+@transaction.atomic
 def expire_overdue_subscriptions() -> int:
-    """
-    Run periodically (Celery beat / cron). Expires paid subscriptions past their
-    period end and drops those users back to Basic.
-    """
-    now = timezone.now()
-    overdue = Subscription.objects.filter(
-        status__in=LIVE_STATUSES, current_period_end__lt=now
-    ).select_related("user")
-    count = 0
-    for sub in overdue:
-        sub.status = SubscriptionStatus.EXPIRED
-        sub.ended_at = now
-        sub.save(update_fields=["status", "ended_at", "updated_at"])
-        assign_default_plan(sub.user)
-        count += 1
-    return count
+    """Expire overdue paid subs/trials and move those users back to Basic."""
 ```
 
-### Seed the three plans: `subscriptions/management/commands/seed_plans.py`
+Invariants implemented there:
 
-Create empty `__init__.py` in both `management/` and `management/commands/`.
+- `assign_default_plan()` is idempotent and handles a soft-deleted Basic plan.
+  The three plans are also inserted by data migration, so registration works on
+  a fresh database.
+- `change_plan()` locks the user's live rows with `select_for_update()`, closes
+  **all** of them (including an elapsed trial), then creates the new row. It
+  rejects unknown, inactive or soft-deleted plans.
+- Paid periods are 30 days (monthly) or 365 days (yearly); Basic never expires
+  (`current_period_end = NULL`).
+- `expire_overdue_subscriptions()` handles both `current_period_end` and
+  `trial_ends_at` and is safe to run repeatedly.
 
-```python
-from django.core.management.base import BaseCommand
+Seed/update the catalog with:
 
-from subscriptions.models import Plan, Tier
-
-PLANS = [
-    dict(tier=Tier.BASIC, name="Basic", price_monthly=0, price_yearly=0,
-         limits={"max_projects": 3, "api_calls_per_day": 1_000, "export": False}),
-    dict(tier=Tier.PLATINUM, name="Platinum", price_monthly=19, price_yearly=190,
-         limits={"max_projects": 25, "api_calls_per_day": 25_000, "export": True}),
-    dict(tier=Tier.DIAMOND, name="Diamond", price_monthly=49, price_yearly=490,
-         limits={"max_projects": None, "api_calls_per_day": None, "export": True}),
-]
-
-
-class Command(BaseCommand):
-    help = "Create or update the Basic / Platinum / Diamond plans"
-
-    def handle(self, *args, **options):
-        for data in PLANS:
-            tier = data.pop("tier")
-            plan, created = Plan.objects.update_or_create(tier=tier, defaults=data)
-            self.stdout.write(f"{'Created' if created else 'Updated'} {plan.name}")
+```bash
+python manage.py seed_plans
+python manage.py expire_subscriptions   # schedule this (Celery beat / cron)
 ```
-
----
 
 ## 5. Permissions (tier gating)
 
-### `subscriptions/permissions.py`
-
 ```python
-from rest_framework.permissions import BasePermission
+from subscriptions.permissions import IsDiamond, IsPlatinumOrHigher
 
-from .models import TIER_RANK, Tier
-from .services import get_user_tier
-
-
-def tier_required(min_tier: str):
-    """Factory: `permission_classes = [tier_required(Tier.PLATINUM)]`"""
-
-    class _HasMinTier(BasePermission):
-        message = f"This feature requires the {min_tier} plan or higher."
-
-        def has_permission(self, request, view):
-            user = request.user
-            if not (user and user.is_authenticated):
-                return False
-            return TIER_RANK[get_user_tier(user)] >= TIER_RANK[min_tier]
-
-    _HasMinTier.__name__ = f"HasMinTier_{min_tier}"
-    return _HasMinTier
-
-
-IsPlatinumOrHigher = tier_required(Tier.PLATINUM)
-IsDiamond = tier_required(Tier.DIAMOND)
+class DiamondFeatureView(APIView):
+    permission_classes = [IsDiamond]
 ```
 
-Failed checks return `403` with the message above; the frontend can show an upgrade prompt.
+`tier_required(min_tier)` reads the tier from the database on every request and
+returns `403` with `code: "tier_required"` when the plan is too low. Unknown tier
+values rank below Basic instead of raising `KeyError`. A failed check returns:
 
----
+```json
+{"detail": "This feature requires the platinum plan or higher.", "code": "tier_required"}
+```
 
-## 6. Auth: serializers
+## 6. Auth serializers and views
 
-### `users/serializers.py`
+### Registration
+
+- `username`, `email`, `first_name`, `last_name`, `password`.
+- Email is lower-cased.
+- Uniqueness is checked against `User.all_objects`, so a soft-deleted account's
+  username/email cannot be silently reused; the DB constraints agree.
+- Django password validators run with the user's attributes.
+- The user and Basic subscription are created atomically.
+- The verification email is queued with `transaction.on_commit` and never blocks
+  the response (failures are logged, not leaked).
+
+Response: `201` with `id`, `username`, `email`, `first_name`, `last_name`.
+No tokens are issued before email verification.
+
+### Login
 
 ```python
-from django.contrib.auth import get_user_model
-from django.contrib.auth.password_validation import validate_password
-from django.db import transaction
-from rest_framework import serializers
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-
-from subscriptions.services import assign_default_plan
-
-User = get_user_model()
-
-
-class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, min_length=8, style={"input_type": "password"})
-
-    class Meta:
-        model = User
-        fields = ("id", "username", "email", "first_name", "last_name", "password")
-        read_only_fields = ("id",)
-
-    def validate_email(self, value):
-        value = value.lower()
-        if User.all_objects.filter(email__iexact=value).exists():
-            raise serializers.ValidationError("A user with this email already exists.")
-        return value
-
-    def validate(self, attrs):
-        # Runs Django's AUTH_PASSWORD_VALIDATORS with user context
-        validate_password(attrs["password"], user=User(**{k: v for k, v in attrs.items() if k != "password"}))
-        return attrs
-
-    @transaction.atomic
-    def create(self, validated_data):
-        password = validated_data.pop("password")
-        user = User.objects.create_user(password=password, **validated_data)
-        assign_default_plan(user)
-        return user
-
-
-class UserSerializer(serializers.ModelSerializer):
-    tier = serializers.CharField(read_only=True)
-
-    class Meta:
-        model = User
-        fields = ("id", "username", "email", "first_name", "last_name", "tier", "date_joined_alias")
-        read_only_fields = fields
-
-    # `date_joined_alias` -> your model has created_at; expose that instead
-    date_joined_alias = serializers.DateTimeField(source="created_at", read_only=True)
-
-
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
-    """Adds non-sensitive claims. Keep claims small; never put secrets in a JWT."""
-
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
         token["username"] = user.username
-        token["tier"] = user.tier   # UI hint only; the server re-checks the DB
+        token["tier"] = user.tier   # UI hint; the server re-checks the DB
         return token
 
-
-class ChangePasswordSerializer(serializers.Serializer):
-    old_password = serializers.CharField(write_only=True)
-    new_password = serializers.CharField(write_only=True)
-
-    def validate_old_password(self, value):
-        if not self.context["request"].user.check_password(value):
-            raise serializers.ValidationError("Old password is incorrect.")
-        return value
-
-    def validate_new_password(self, value):
-        validate_password(value, user=self.context["request"].user)
-        return value
+    def validate(self, attrs):
+        data = super().validate(attrs)  # credentials first
+        if not self.user.is_email_verified:
+            raise EmailNotVerified()    # 403, code="email_not_verified"
+        return data
 ```
 
-(Delete the awkward `date_joined_alias` line in `UserSerializer.Meta.fields` if you'd rather expose `created_at` directly: `fields = (..., "tier", "created_at")`.)
-
-## 7. Auth: views
-
-### `users/views.py`
+`LoginView` moves `refresh` out of the JSON body into the cookie:
 
 ```python
+response = super().post(request, *args, **kwargs)
+if response.status_code == 200:
+    refresh = response.data.pop("refresh", None)
+    if refresh:
+        set_refresh_cookie(response, refresh)
+```
+
+Checking credentials first means a wrong password on an unverified account gets
+the normal `401`, not `403 email_not_verified`, so the endpoint does not reveal
+verification state to someone without the password.
+
+### Refresh
+
+`CookieTokenRefreshSerializer` reads the cookie, verifies signature/expiry/
+blacklist, then checks the user still exists and is active (`User.objects`, so
+soft-deleted users are rejected) before rotating. Missing cookie →
+`401 no_refresh_cookie`; deleted/inactive user → `401 user_inactive`; invalid or
+replayed token → `401 token_not_valid`.
+
+Only `{"access": "..."}` is returned; the rotated refresh token is set as the new
+cookie. Clients must **single-flight** refresh calls: two parallel refreshes with
+the same cookie will blacklist it after the first succeeds.
+
+### Logout
+
+`POST /api/v1/auth/logout/` needs no access token (so it still works after
+expiry), blacklists the refresh token from the cookie, clears the cookie and
+returns `204`.
+
+### Current user
+
+`GET /api/v1/auth/me/` returns `id`, `username`, `email`, `first_name`,
+`last_name`, `tier` (DB-fresh), `email_verified`, `created_at`.
+
+### Change password
+
+Requires the old password and the access token. On success: revokes every
+outstanding refresh token for the user, clears the refresh cookie and returns
+`200`. The client must discard its access token and go back to the login screen.
+
+## 7. Subscription endpoints
+
+| Method | Path                                  | Auth | Description                          |
+| ------ | ------------------------------------- | ---- | ------------------------------------ |
+| GET    | `/api/v1/subscriptions/plans/`        | No   | Public pricing catalog               |
+| GET    | `/api/v1/subscriptions/me/`           | Yes  | Live subscription + limits           |
+| GET    | `/api/v1/subscriptions/demo/platinum/`| Yes  | Demo: Platinum or higher (`403`)     |
+| GET    | `/api/v1/subscriptions/demo/diamond/` | Yes  | Demo: Diamond only (`403`)           |
+
+`/subscriptions/me/` returns:
+
+```json
+{
+  "tier": "platinum",
+  "plan": {"tier": "platinum", "name": "Platinum", "price_monthly": "19.00", "limits": {"max_projects": 25}},
+  "limits": {"max_projects": 25},
+  "status": "active",
+  "billing_cycle": "monthly",
+  "started_at": "...",
+  "current_period_start": "...",
+  "current_period_end": "...",
+  "cancel_at_period_end": false
+}
+```
+
+To test an upgrade locally:
+
+```bash
+python manage.py shell -c "
 from django.contrib.auth import get_user_model
-from rest_framework import generics, status
-from rest_framework.permissions import AllowAny, IsAuthenticated
-from rest_framework.response import Response
-from rest_framework.views import APIView
-from rest_framework_simplejwt.exceptions import TokenError
-from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
-
-from .serializers import (
-    ChangePasswordSerializer,
-    CustomTokenObtainPairSerializer,
-    RegisterSerializer,
-    UserSerializer,
-)
-
-User = get_user_model()
-
-
-class RegisterView(generics.CreateAPIView):
-    serializer_class = RegisterSerializer
-    permission_classes = [AllowAny]
-    throttle_scope = "register"
-
-
-class LoginView(TokenObtainPairView):
-    serializer_class = CustomTokenObtainPairSerializer
-    throttle_scope = "login"
-
-
-class LogoutView(APIView):
-    """Blacklists the refresh token so it can never mint new access tokens."""
-
-    permission_classes = [IsAuthenticated]
-
-    def post(self, request):
-        try:
-            RefreshToken(request.data["refresh"]).blacklist()
-        except (KeyError, TokenError):
-            return Response({"detail": "Invalid or missing refresh token."}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(status=status.HTTP_205_RESET_CONTENT)
-
-
-class MeView(generics.RetrieveAPIView):
-    serializer_class = UserSerializer
-
-    def get_object(self):
-        return self.request.user
-
-
-class ChangePasswordView(APIView):
-    def post(self, request):
-        ser = ChangePasswordSerializer(data=request.data, context={"request": request})
-        ser.is_valid(raise_exception=True)
-        request.user.set_password(ser.validated_data["new_password"])
-        request.user.save(update_fields=["password"])
-        # Revoke all outstanding refresh tokens so other sessions are signed out
-        from rest_framework_simplejwt.token_blacklist.models import (
-            BlacklistedToken,
-            OutstandingToken,
-        )
-        for t in OutstandingToken.objects.filter(user=request.user):
-            BlacklistedToken.objects.get_or_create(token=t)
-        return Response({"detail": "Password updated. Please log in again."})
+from subscriptions.services import change_plan
+change_plan(get_user_model().objects.get(username='sam'), 'platinum')
+"
 ```
 
-### `subscriptions/views.py`
-
-```python
-from rest_framework import serializers
-from rest_framework.response import Response
-from rest_framework.views import APIView
-
-from .models import Plan
-from .permissions import IsDiamond, IsPlatinumOrHigher
-from .services import get_live_subscription
-
-
-class PlanSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Plan
-        fields = ("tier", "name", "description", "price_monthly", "price_yearly", "currency", "limits")
-
-
-class SubscriptionSerializer(serializers.Serializer):
-    tier = serializers.CharField(source="plan.tier")
-    status = serializers.CharField()
-    billing_cycle = serializers.CharField()
-    current_period_end = serializers.DateTimeField()
-    cancel_at_period_end = serializers.BooleanField()
-
-
-class PlanListView(APIView):
-    permission_classes = []          # public pricing page
-    authentication_classes = []
-
-    def get(self, request):
-        plans = Plan.objects.filter(is_active=True).order_by("price_monthly")
-        return Response(PlanSerializer(plans, many=True).data)
-
-
-class MySubscriptionView(APIView):
-    def get(self, request):
-        sub = get_live_subscription(request.user)
-        return Response(SubscriptionSerializer(sub).data if sub else {"tier": "basic"})
-
-
-# --- Example gated endpoints -------------------------------------------------
-class PlatinumFeatureView(APIView):
-    permission_classes = [IsPlatinumOrHigher]
-
-    def get(self, request):
-        return Response({"detail": "Platinum+ feature unlocked."})
-
-
-class DiamondFeatureView(APIView):
-    permission_classes = [IsDiamond]
-
-    def get(self, request):
-        return Response({"detail": "Diamond-only feature unlocked."})
-```
+The next request with the **same access token** is allowed, because permissions
+read the DB, not the `tier` claim.
 
 ## 8. URLs
 
-### `users/urls.py`
-
 ```python
-from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView, TokenVerifyView
-
-from .views import ChangePasswordView, LoginView, LogoutView, MeView, RegisterView
-
-urlpatterns = [
-    path("register/", RegisterView.as_view(), name="register"),
-    path("login/", LoginView.as_view(), name="login"),
-    path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
-    path("token/verify/", TokenVerifyView.as_view(), name="token_verify"),
-    path("logout/", LogoutView.as_view(), name="logout"),
-    path("me/", MeView.as_view(), name="me"),
-    path("change-password/", ChangePasswordView.as_view(), name="change_password"),
-]
-```
-
-### `subscriptions/urls.py`
-
-```python
-from django.urls import path
-
-from .views import DiamondFeatureView, MySubscriptionView, PlanListView, PlatinumFeatureView
-
-urlpatterns = [
-    path("plans/", PlanListView.as_view(), name="plans"),
-    path("me/", MySubscriptionView.as_view(), name="my_subscription"),
-    path("demo/platinum/", PlatinumFeatureView.as_view()),
-    path("demo/diamond/", DiamondFeatureView.as_view()),
-]
-```
-
-### `config/urls.py`
-
-```python
-from django.contrib import admin
-from django.urls import include, path
-
+# config/urls.py
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/v1/auth/", include("users.urls")),
@@ -761,531 +546,220 @@ urlpatterns = [
 ]
 ```
 
----
+`users/urls.py` exposes:
 
-## 9. Migrate and run (order matters)
+```
+register/  verify-email/  resend-verification/  login/
+token/refresh/  logout/  me/  change-password/
+password-reset/  password-reset/confirm/
+```
+
+`subscriptions/urls.py` exposes `plans/`, `me/`, `demo/platinum/`,
+`demo/diamond/`. There is deliberately no upgrade endpoint.
+
+## 9. Migrate and run
 
 ```bash
-python manage.py makemigrations users subscriptions
-python manage.py migrate
-python manage.py seed_plans
-python manage.py createsuperuser
+uv sync
+python manage.py migrate            # 0003_seed_plans inserts Basic/Platinum/Diamond
+python manage.py seed_plans         # optional: re-apply the seed data
+python manage.py createsuperuser    # superusers are created email-verified
 python manage.py runserver
 ```
 
-If you already migrated with the default `auth.User` before setting `AUTH_USER_MODEL`, delete the dev DB and migrations and start over. Swapping the user model mid-project is painful.
+The data migration means a fresh database has plans before the first
+registration. `seed_plans` is idempotent and also restores a soft-deleted plan.
 
-## 10. Try it
+If the project was migrated with Django's default `auth.User` before
+`AUTH_USER_MODEL` was set, you must start the database over; swapping the user
+model mid-project is painful.
+
+## 10. Try it (cookie flow)
 
 ```bash
-# register
-curl -X POST localhost:8000/api/v1/auth/register/ -H "Content-Type: application/json" \
+# 1. Register -> verification link is printed by the console email backend
+curl -X POST localhost:8000/api/v1/auth/register/ \
+  -H "Content-Type: application/json" \
   -d '{"username":"sam","email":"sam@example.com","password":"S0me-Str0ng-Pass"}'
 
-# login -> {"access": "...", "refresh": "..."}
-curl -X POST localhost:8000/api/v1/auth/login/ -H "Content-Type: application/json" \
+# 2. Login before verifying -> 403 {"code":"email_not_verified"}
+
+# 3. Verify using the token from the email link
+curl -X POST localhost:8000/api/v1/auth/verify-email/ \
+  -H "Content-Type: application/json" -d '{"token":"<token>"}'
+
+# 4. Login: -c saves the HttpOnly refresh cookie; body only has "access"
+curl -c cookies.txt -X POST localhost:8000/api/v1/auth/login/ \
+  -H "Content-Type: application/json" \
   -d '{"username":"sam","password":"S0me-Str0ng-Pass"}'
 
-# call an endpoint
+# 5. Call the API with the access token
 curl localhost:8000/api/v1/auth/me/ -H "Authorization: Bearer <access>"
 
-# gated endpoint (403 for Basic users)
-curl localhost:8000/api/v1/subscriptions/demo/platinum/ -H "Authorization: Bearer <access>"
-
-# refresh / logout
-curl -X POST localhost:8000/api/v1/auth/token/refresh/ -H "Content-Type: application/json" -d '{"refresh":"<refresh>"}'
-curl -X POST localhost:8000/api/v1/auth/logout/ -H "Authorization: Bearer <access>" -H "Content-Type: application/json" -d '{"refresh":"<refresh>"}'
-```
-
-To test an upgrade locally: `python manage.py shell` then
-`from subscriptions.services import change_plan; change_plan(User.objects.get(username="sam"), "platinum")`.
-
-## 11. Tests worth writing first (`subscriptions/tests.py`)
-
-```python
-from django.core.management import call_command
-from django.test import TestCase
-from rest_framework.test import APIClient
-
-from subscriptions.services import change_plan
-
-
-class TierGatingTests(TestCase):
-    def setUp(self):
-        call_command("seed_plans")
-        self.client = APIClient()
-        self.client.post("/api/v1/auth/register/", {"username": "a", "email": "a@x.com", "password": "S0me-Str0ng-Pass"})
-        res = self.client.post("/api/v1/auth/login/", {"username": "a", "password": "S0me-Str0ng-Pass"})
-        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {res.data['access']}")
-
-    def test_basic_blocked_from_platinum(self):
-        self.assertEqual(self.client.get("/api/v1/subscriptions/demo/platinum/").status_code, 403)
-
-    def test_upgrade_takes_effect_without_new_token(self):
-        from django.contrib.auth import get_user_model
-        change_plan(get_user_model().objects.get(username="a"), "platinum")
-        self.assertEqual(self.client.get("/api/v1/subscriptions/demo/platinum/").status_code, 200)
-        self.assertEqual(self.client.get("/api/v1/subscriptions/demo/diamond/").status_code, 403)
-```
-
----
-
-## 12. Refresh token in an HttpOnly cookie
-
-Why: if the refresh token is returned in JSON and stored in `localStorage`, any XSS bug lets an attacker steal a 7-day credential. In an `HttpOnly` cookie, JavaScript cannot read it. The access token stays in memory (a JS variable) only.
-
-### Settings (`config/settings.py`, below `SIMPLE_JWT`)
-
-```python
-AUTH_COOKIE_REFRESH = "refresh_token"
-AUTH_COOKIE_SECURE = not DEBUG          # True in production (HTTPS only)
-AUTH_COOKIE_SAMESITE = "Lax"            # "None" only for a cross-site frontend (requires Secure + CSRF defense below)
-AUTH_COOKIE_PATH = "/api/v1/auth/"      # cookie is only sent to auth endpoints, not every API call
-AUTH_COOKIE_MAX_AGE = int(SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds())
-
-# Throttle scope used by the email endpoints in section 13
-REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]["email"] = "5/hour"
-
-# If your frontend is on another origin (pip install django-cors-headers):
-# CORS_ALLOWED_ORIGINS = ["https://app.example.com"]
-# CORS_ALLOW_CREDENTIALS = True
-```
-
-### `users/cookies.py`
-
-```python
-from django.conf import settings
-
-
-def set_refresh_cookie(response, refresh_token: str) -> None:
-    response.set_cookie(
-        key=settings.AUTH_COOKIE_REFRESH,
-        value=refresh_token,
-        max_age=settings.AUTH_COOKIE_MAX_AGE,
-        httponly=True,
-        secure=settings.AUTH_COOKIE_SECURE,
-        samesite=settings.AUTH_COOKIE_SAMESITE,
-        path=settings.AUTH_COOKIE_PATH,
-    )
-
-
-def delete_refresh_cookie(response) -> None:
-    response.delete_cookie(
-        key=settings.AUTH_COOKIE_REFRESH,
-        path=settings.AUTH_COOKIE_PATH,
-        samesite=settings.AUTH_COOKIE_SAMESITE,
-    )
-```
-
-### Add to `users/serializers.py`
-
-```python
-from django.conf import settings
-from rest_framework_simplejwt.exceptions import InvalidToken
-from rest_framework_simplejwt.serializers import TokenRefreshSerializer
-
-
-class CookieTokenRefreshSerializer(TokenRefreshSerializer):
-    """Reads the refresh token from the cookie instead of the request body."""
-
-    refresh = serializers.CharField(required=False)
-
-    def validate(self, attrs):
-        attrs["refresh"] = self.context["request"].COOKIES.get(settings.AUTH_COOKIE_REFRESH)
-        if not attrs["refresh"]:
-            raise InvalidToken("No refresh token cookie found.")
-        return super().validate(attrs)
-```
-
-### Replace the login / refresh / logout views in `users/views.py`
-
-```python
-from django.conf import settings
-from rest_framework_simplejwt.views import TokenRefreshView
-
-from .cookies import delete_refresh_cookie, set_refresh_cookie
-from .serializers import CookieTokenRefreshSerializer
-
-
-class LoginView(TokenObtainPairView):
-    serializer_class = CustomTokenObtainPairSerializer
-    throttle_scope = "login"
-
-    def finalize_response(self, request, response, *args, **kwargs):
-        if response.status_code == status.HTTP_200_OK and "refresh" in response.data:
-            set_refresh_cookie(response, response.data.pop("refresh"))  # move to cookie, hide from body
-        return super().finalize_response(request, response, *args, **kwargs)
-
-
-class CookieTokenRefreshView(TokenRefreshView):
-    serializer_class = CookieTokenRefreshSerializer
-
-    def finalize_response(self, request, response, *args, **kwargs):
-        if response.status_code == status.HTTP_200_OK and "refresh" in response.data:
-            set_refresh_cookie(response, response.data.pop("refresh"))  # rotated token
-        return super().finalize_response(request, response, *args, **kwargs)
-
-
-class LogoutView(APIView):
-    """Works even if the access token already expired, so it needs no auth."""
-
-    permission_classes = [AllowAny]
-    authentication_classes = []
-
-    def post(self, request):
-        raw = request.COOKIES.get(settings.AUTH_COOKIE_REFRESH)
-        if raw:
-            try:
-                RefreshToken(raw).blacklist()
-            except TokenError:
-                pass  # already invalid: nothing to revoke
-        response = Response(status=status.HTTP_205_RESET_CONTENT)
-        delete_refresh_cookie(response)
-        return response
-```
-
-In `users/urls.py`, swap the refresh route to `CookieTokenRefreshView.as_view()` and drop `TokenVerifyView` if you don't need it.
-
-### Frontend contract
-
-```js
-// every request to the API must include credentials so the cookie is sent/stored
-fetch("https://api.example.com/api/v1/auth/login/", {
-  method: "POST",
-  credentials: "include",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ username, password }),
-});
-// -> response body: { access: "..." }  (keep in memory, never localStorage)
-// on a 401: POST /auth/token/refresh/ with credentials: "include", retry once with the new access token
-// on page load: call refresh once to restore the session (access token is gone after a reload)
-```
-
-### CSRF note
-
-Cookies are sent automatically, so refresh and logout are CSRF targets in principle. With `SameSite=Lax` (and the cookie path limited to `/api/v1/auth/`) cross-site POSTs don't carry the cookie, which covers the common same-site setup (e.g. `app.example.com` + `api.example.com`). If you must use `SameSite=None` for a truly cross-site frontend, add a CSRF defense: require a custom header on those two endpoints (e.g. `X-Requested-With: XMLHttpRequest`, which cross-site forms can't set and CORS will block) or use Django's CSRF token flow.
-
----
-
-## 13. Email verification + password reset
-
-### 13.1 Model and manager changes
-
-`users/models.py`, add to `User`:
-
-```python
-    email_verified_at = models.DateTimeField(
-        null=True,
-        blank=True,
-        verbose_name=_("Email Verified At"),
-    )
-
-    @property
-    def is_email_verified(self) -> bool:
-        return self.email_verified_at is not None
-```
-
-`users/services.py`, in `UserManager.create_superuser` add (and `from django.utils import timezone` at the top) so admins aren't locked out:
-
-```python
-        extra_fields.setdefault("email_verified_at", timezone.now())
-```
-
-Then run `makemigrations users && migrate`.
-
-### 13.2 Settings
-
-```python
-FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000")
-EMAIL_VERIFY_MAX_AGE = 60 * 60 * 24   # 24 hours
-PASSWORD_RESET_TIMEOUT = 60 * 60      # 1 hour (Django's built-in setting used by the reset token)
-```
-
-### 13.3 Tokens and emails: `users/tokens.py`
-
-```python
-from django.conf import settings
-from django.contrib.auth import get_user_model
-from django.contrib.auth.tokens import default_token_generator
-from django.core import signing
-from django.core.exceptions import ValidationError as DjangoValidationError
-from django.core.mail import send_mail
-from django.utils.encoding import force_bytes, force_str
-from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
-from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
-
-User = get_user_model()
-EMAIL_VERIFY_SALT = "users.email-verify"
-
-
-# ---- email verification (signed, time-limited, tied to the current email) ----
-def make_email_verification_token(user) -> str:
-    return signing.dumps({"uid": str(user.pk), "email": user.email}, salt=EMAIL_VERIFY_SALT)
-
-
-def user_from_email_verification_token(token: str):
-    """Returns the user or raises ValueError. Changing the email invalidates old links."""
-    try:
-        data = signing.loads(token, salt=EMAIL_VERIFY_SALT, max_age=settings.EMAIL_VERIFY_MAX_AGE)
-        return User.objects.get(pk=data["uid"], email=data["email"])
-    except (signing.BadSignature, User.DoesNotExist, DjangoValidationError, KeyError):
-        raise ValueError("Invalid or expired token.")
-
-
-def send_verification_email(user) -> None:
-    link = f"{settings.FRONTEND_URL}/verify-email?token={make_email_verification_token(user)}"
-    send_mail(
-        subject="Verify your email",
-        message=f"Hi {user.username},\n\nConfirm your email address:\n{link}\n\nThis link expires in 24 hours.",
-        from_email=settings.DEFAULT_FROM_EMAIL,
-        recipient_list=[user.email],
-    )
-
-
-# ---- password reset (Django's generator: single use, dies when the password changes) ----
-def send_password_reset_email(user) -> None:
-    uid = urlsafe_base64_encode(force_bytes(user.pk))
-    token = default_token_generator.make_token(user)
-    link = f"{settings.FRONTEND_URL}/reset-password?uid={uid}&token={token}"
-    send_mail(
-        subject="Reset your password",
-        message=f"Hi {user.username},\n\nReset your password:\n{link}\n\nIf you didn't ask for this, ignore this email.",
-        from_email=settings.DEFAULT_FROM_EMAIL,
-        recipient_list=[user.email],
-    )
-
-
-def user_from_reset_credentials(uidb64: str, token: str):
-    try:
-        user = User.objects.get(pk=force_str(urlsafe_base64_decode(uidb64)))
-    except (User.DoesNotExist, ValueError, TypeError, OverflowError, DjangoValidationError):
-        raise ValueError("Invalid reset link.")
-    if not default_token_generator.check_token(user, token):
-        raise ValueError("Invalid or expired reset link.")
-    return user
-
-
-def revoke_all_refresh_tokens(user) -> None:
-    """Sign the user out of every device."""
-    for t in OutstandingToken.objects.filter(user=user):
-        BlacklistedToken.objects.get_or_create(token=t)
-```
-
-You can now replace the inline loop in `ChangePasswordView` with `revoke_all_refresh_tokens(request.user)`.
-
-### 13.4 Send the email at registration
-
-In `RegisterSerializer.create` (`users/serializers.py`):
-
-```python
-from .tokens import send_verification_email
-
-    @transaction.atomic
-    def create(self, validated_data):
-        password = validated_data.pop("password")
-        user = User.objects.create_user(password=password, **validated_data)
-        assign_default_plan(user)
-        # only send once the transaction is committed
-        transaction.on_commit(lambda: send_verification_email(user))
-        return user
-```
-
-### 13.5 Block login until verified
-
-Update `CustomTokenObtainPairSerializer` in `users/serializers.py`:
-
-```python
-from rest_framework.exceptions import AuthenticationFailed
-
-
-class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
-    @classmethod
-    def get_token(cls, user):
-        token = super().get_token(user)
-        token["username"] = user.username
-        token["tier"] = user.tier
-        return token
-
-    def validate(self, attrs):
-        data = super().validate(attrs)          # checks credentials first
-        if not self.user.is_email_verified:
-            raise AuthenticationFailed(
-                "Please verify your email before logging in.", code="email_not_verified"
-            )
-        return data
-```
-
-The credentials are checked first, so a wrong password never reveals whether an account is verified.
-
-### 13.6 Serializers (add to `users/serializers.py`)
-
-```python
-from .tokens import user_from_email_verification_token, user_from_reset_credentials
-
-
-class VerifyEmailSerializer(serializers.Serializer):
-    token = serializers.CharField()
-
-    def validate(self, attrs):
-        try:
-            attrs["user"] = user_from_email_verification_token(attrs["token"])
-        except ValueError as exc:
-            raise serializers.ValidationError({"token": str(exc)})
-        return attrs
-
-
-class EmailOnlySerializer(serializers.Serializer):
-    email = serializers.EmailField()
-
-
-class PasswordResetConfirmSerializer(serializers.Serializer):
-    uid = serializers.CharField()
-    token = serializers.CharField()
-    new_password = serializers.CharField(write_only=True)
-
-    def validate(self, attrs):
-        try:
-            user = user_from_reset_credentials(attrs["uid"], attrs["token"])
-        except ValueError as exc:
-            raise serializers.ValidationError({"token": str(exc)})
-        validate_password(attrs["new_password"], user=user)
-        attrs["user"] = user
-        return attrs
-```
-
-### 13.7 Views (add to `users/views.py`)
-
-```python
-from django.utils import timezone
-
-from .serializers import EmailOnlySerializer, PasswordResetConfirmSerializer, VerifyEmailSerializer
-from .tokens import revoke_all_refresh_tokens, send_password_reset_email, send_verification_email
-
-
-class _PublicEmailView(APIView):
-    permission_classes = [AllowAny]
-    authentication_classes = []
-    throttle_scope = "email"
-
-
-class VerifyEmailView(_PublicEmailView):
-    def post(self, request):
-        ser = VerifyEmailSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        user = ser.validated_data["user"]
-        if not user.is_email_verified:
-            user.email_verified_at = timezone.now()
-            user.save(update_fields=["email_verified_at", "updated_at"])
-        return Response({"detail": "Email verified. You can now log in."})
-
-
-class ResendVerificationView(_PublicEmailView):
-    def post(self, request):
-        ser = EmailOnlySerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        user = User.objects.filter(email__iexact=ser.validated_data["email"]).first()
-        if user and not user.is_email_verified:
-            send_verification_email(user)
-        # identical response whether or not the account exists (no user enumeration)
-        return Response({"detail": "If that account needs verification, an email has been sent."})
-
-
-class PasswordResetRequestView(_PublicEmailView):
-    def post(self, request):
-        ser = EmailOnlySerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        user = User.objects.filter(
-            email__iexact=ser.validated_data["email"], is_active=True
-        ).first()
-        if user:
-            send_password_reset_email(user)
-        return Response({"detail": "If that email is registered, a reset link has been sent."})
-
-
-class PasswordResetConfirmView(_PublicEmailView):
-    def post(self, request):
-        ser = PasswordResetConfirmSerializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        user = ser.validated_data["user"]
-        user.set_password(ser.validated_data["new_password"])
-        # a successful reset also proves ownership of the email
-        if not user.is_email_verified:
-            user.email_verified_at = timezone.now()
-        user.save()
-        revoke_all_refresh_tokens(user)
-        return Response({"detail": "Password reset. Please log in with your new password."})
-```
-
-### 13.8 URLs (`users/urls.py`)
-
-```python
-from .views import (
-    ChangePasswordView, CookieTokenRefreshView, LoginView, LogoutView, MeView,
-    PasswordResetConfirmView, PasswordResetRequestView, RegisterView,
-    ResendVerificationView, VerifyEmailView,
-)
-
-urlpatterns = [
-    path("register/", RegisterView.as_view(), name="register"),
-    path("verify-email/", VerifyEmailView.as_view(), name="verify_email"),
-    path("resend-verification/", ResendVerificationView.as_view(), name="resend_verification"),
-    path("login/", LoginView.as_view(), name="login"),
-    path("token/refresh/", CookieTokenRefreshView.as_view(), name="token_refresh"),
-    path("logout/", LogoutView.as_view(), name="logout"),
-    path("me/", MeView.as_view(), name="me"),
-    path("change-password/", ChangePasswordView.as_view(), name="change_password"),
-    path("password-reset/", PasswordResetRequestView.as_view(), name="password_reset"),
-    path("password-reset/confirm/", PasswordResetConfirmView.as_view(), name="password_reset_confirm"),
-]
-```
-
-In dev, `EMAIL_BACKEND` already defaults to the console backend in your settings, so verification and reset links print in the terminal.
-
----
-
-## 14. Trying the full flow (updated)
-
-```bash
-# 1. register -> a verification link is printed in the runserver console
-curl -X POST localhost:8000/api/v1/auth/register/ -H "Content-Type: application/json" \
-  -d '{"username":"sam","email":"sam@example.com","password":"S0me-Str0ng-Pass"}'
-
-# 2. login before verifying -> 401/403 "email_not_verified"
-# 3. verify with the token from the link
-curl -X POST localhost:8000/api/v1/auth/verify-email/ -H "Content-Type: application/json" -d '{"token":"<token>"}'
-
-# 4. login; -c saves the refresh cookie. Body only has "access"
-curl -c cookies.txt -X POST localhost:8000/api/v1/auth/login/ -H "Content-Type: application/json" \
-  -d '{"username":"sam","password":"S0me-Str0ng-Pass"}'
-
-# 5. call the API
-curl localhost:8000/api/v1/auth/me/ -H "Authorization: Bearer <access>"
-
-# 6. refresh: -b sends the cookie, -c stores the rotated one
+# 6. Refresh: -b sends the cookie, -c stores the rotated one
 curl -b cookies.txt -c cookies.txt -X POST localhost:8000/api/v1/auth/token/refresh/
 
-# 7. logout
+# 7. Logout
 curl -b cookies.txt -c cookies.txt -X POST localhost:8000/api/v1/auth/logout/
 
-# 8. password reset
-curl -X POST localhost:8000/api/v1/auth/password-reset/ -H "Content-Type: application/json" -d '{"email":"sam@example.com"}'
-curl -X POST localhost:8000/api/v1/auth/password-reset/confirm/ -H "Content-Type: application/json" \
+# 8. Password reset
+curl -X POST localhost:8000/api/v1/auth/password-reset/ \
+  -H "Content-Type: application/json" -d '{"email":"sam@example.com"}'
+curl -X POST localhost:8000/api/v1/auth/password-reset/confirm/ \
+  -H "Content-Type: application/json" \
   -d '{"uid":"<uid>","token":"<token>","new_password":"An0ther-Str0ng-Pass"}'
 ```
 
-Update the tests from section 11: in `setUp`, mark the user verified before logging in (`User.objects.filter(username="a").update(email_verified_at=timezone.now())`), and read the refresh token from `res.cookies["refresh_token"].value` instead of the response body. To assert the verification email in tests, wrap registration in `with self.captureOnCommitCallbacks(execute=True):` and check `django.core.mail.outbox`.
+Requests to the auth endpoints from a browser must use
+`credentials: "include"` so the cookie is stored/sent.
 
----
+## 11. Tests
 
-## 15. Industry-standard hardening checklist (what to do next)
+```bash
+python manage.py test users subscriptions
+```
 
-1. **Payments**: integrate Stripe Checkout + a `/webhooks/stripe/` endpoint that verifies the signature and calls `change_plan()` / marks `PAST_DUE` / `CANCELED`. Handle webhook idempotency (store processed event ids).
-2. **Refresh token storage**: done in section 12 (HttpOnly cookie). Remember to keep the access token in memory only.
-3. **Periodic job**: schedule `expire_overdue_subscriptions()` (Celery beat or cron) and `python manage.py flushexpiredtokens` for the blacklist tables.
-4. **Production settings**: `DEBUG=False`, real `SECRET_KEY` (no default), `SECURE_SSL_REDIRECT`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`, `SECURE_HSTS_SECONDS`, CORS allow-list (`django-cors-headers`) for your frontend origin only.
-5. **Email verification and password reset**: done in section 13. Next: send emails from a background worker (Celery) instead of inside the request, and use HTML templates.
-6. **Rate limits per plan**: subclass `UserRateThrottle` and read `plan.limits["api_calls_per_day"]` for per-tier quotas.
-7. **Caching**: if tier lookups become hot, cache `get_user_tier` in Redis for ~60s and invalidate inside `change_plan`.
-8. **Admin**: register `Plan` and `Subscription` (and a `UserAdmin` subclass) so support can inspect and adjust subscriptions.
-9. **Observability**: log auth events with your `log.prod` channel (login, failed login, plan change); never log tokens or passwords.
-10. **API docs**: `drf-spectacular` for OpenAPI, with the Bearer security scheme.
+The suite covers registration, soft-deleted account reuse, password validators,
+verification, login gating, cookie flags, refresh rotation/replay, logout
+blacklisting, soft-delete lockout, change-password revocation, full password
+reset and single-use reset tokens, tier gating, immediate upgrades/downgrades,
+expiry fallback and the public catalog. Use `captureOnCommitCallbacks` when
+asserting emails:
+
+```python
+with self.captureOnCommitCallbacks(execute=True):
+    response = self.client.post("/api/v1/auth/register/", payload, format="json")
+
+self.assertEqual(len(mail.outbox), 1)
+```
+
+A representative tier test:
+
+```python
+def test_upgrade_takes_effect_without_a_new_token(self):
+    change_plan(self.user, "platinum")
+    # reuse the access token issued while the user was Basic
+    self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {self.access}")
+    self.assertEqual(self.client.get(PLATINUM_URL).status_code, 200)
+    self.assertEqual(self.client.get(DIAMOND_URL).status_code, 403)
+```
+
+## 12. Refresh cookie, CSRF and CORS
+
+Why the cookie: a refresh token in JSON + `localStorage` is stealable by any XSS
+bug for 7 days. In an `HttpOnly` cookie JavaScript cannot read it, and the
+restricted `Path=/api/v1/auth/` means it is not sent on normal API calls. The
+access token stays in a JavaScript variable only.
+
+Cookie attributes: `HttpOnly`, `Secure` (production), `SameSite` from settings
+(default `Lax`), `Path=/api/v1/auth/`, `Max-Age=7 days`. Refresh rotation issues
+a fresh cookie each time, so an actively used session slides forward.
+
+CSRF: with `SameSite=Lax` and the restricted path, cross-site POSTs do not carry
+the cookie, which covers the common `app.example.com` + `api.example.com` setup.
+If the frontend is truly cross-site and needs `SameSite=None`, you **must** use
+HTTPS (`Secure`) and add a CSRF defense for the cookie-authenticated endpoints,
+for example requiring `X-Requested-With: XMLHttpRequest` (cross-site forms cannot
+set it and CORS will block it) or a double-submit CSRF token.
+
+CORS: in production use `django-cors-headers` with an explicit allow-list and
+`CORS_ALLOW_CREDENTIALS = True`; never `CORS_ALLOW_ALL_ORIGINS` together with
+credentials.
+
+The frontend contract (refresh retry, page-load session restore, single-flight
+refresh, error codes) is documented in [`auth-api.md`](./auth-api.md).
+
+## 13. Email verification and password reset
+
+- **Verification token**: `django.core.signing` payload `{uid, email}` with salt
+  `users.email-verify`, `max_age=EMAIL_VERIFY_MAX_AGE` (24 h). Because the email
+  is part of the signed payload, changing it invalidates old links.
+- **Password reset token**: Django's `default_token_generator` (hashes the
+  password, `last_login` and timestamp), `PASSWORD_RESET_TIMEOUT` (1 h).
+  Single-use because it dies once the password changes.
+- **No enumeration**: `/resend-verification/` and `/password-reset/` always return
+  the same `200` body whether or not the account exists. Reset requests only act
+  on active accounts.
+- **Revocation**: reset and change-password call `revoke_all_refresh_tokens()`,
+  which blacklists every outstanding refresh token for the user (all devices).
+- **Reset also verifies the email**: successfully consuming a reset link proves
+  ownership, so `email_verified_at` is set if it was missing.
+- **Delivery**: emails are sent synchronously in this implementation; failures are
+  logged and never leak account existence. Move `send_mail` to a background
+  worker (Celery/RQ) with retries for production. In development the console
+  backend prints the links.
+
+## 14. Full flow checklist
+
+1. Register → `201`, user unverified, Basic subscription created.
+2. Login before verification → `403 email_not_verified`.
+3. Verify email with the emailed token → `200` (idempotent).
+4. Login → `200 {access}` + `Set-Cookie: refresh_token=...; HttpOnly; ...`.
+5. Call `/auth/me/` with the bearer token → `200` with DB-fresh tier.
+6. Call a gated endpoint → `403 tier_required` for Basic, `200` after upgrade.
+7. Wait for access expiry (or delete it) → `401`; call `/token/refresh/` with the
+   cookie → new access + rotated cookie.
+8. Replay the old refresh cookie → `401 token_not_valid`.
+9. Logout → `204`, cookie cleared, refresh blacklisted.
+10. Password reset/change → all refresh tokens revoked; log in again.
+
+## 15. Production hardening and known trade-offs
+
+1. **Payments**: integrate Stripe Checkout + a `/webhooks/stripe/` endpoint that
+   verifies the signature and calls `change_plan()` / marks `PAST_DUE` /
+   `CANCELED`. Store processed event ids for idempotency. Never trust a client
+   to choose its plan.
+2. **CORS/CSRF**: explicit origin allow-list, credentials enabled, CSRF defense
+   if `SameSite=None`.
+3. **Periodic jobs**: schedule `python manage.py expire_subscriptions` and
+   `python manage.py flushexpiredtokens` (blacklist tables grow over time).
+4. **Secrets/transport**: `DEBUG=False`, real `SECRET_KEY` (no fallback), HTTPS,
+   HSTS, secure cookies, `ALLOWED_HOSTS` set.
+5. **Email**: background sending, HTML templates, verified sending domain.
+6. **Per-plan rate limits**: subclass `UserRateThrottle` and read
+   `plan.limits["api_calls_per_day"]`.
+7. **Caching**: if tier lookups get hot, cache `get_user_tier` for ~60 s and
+   invalidate in `change_plan`; do not cache the access-token claim.
+8. **Admin/observability**: `Plan`/`Subscription`/`User` admins are registered.
+   Auth events are logged on the `app.prod` channel; never log tokens/passwords.
+9. **API docs**: `drf-spectacular` for OpenAPI with the Bearer security scheme.
+
+Known trade-offs (documented, not bugs):
+
+- Logout/password change **cannot revoke an already-issued access token**; it
+  remains valid for at most 15 minutes. Clients must discard it.
+- Refresh rotation only blacklists the used token. It does not implement
+  refresh-token **reuse detection with family revocation**; for that, track token
+  families and revoke the whole family when a blacklisted token is presented.
+- Login throttling is per-IP and per-scope; add per-account lockout/backoff if
+  you need stronger brute-force protection.
+- Access tokens carry a `tier` claim that can be stale after a plan change. Treat
+  it as a UI hint and re-read `/auth/me/` or `/subscriptions/me/` (the server
+  always uses the DB for authorization).
+
+## 16. Corrections vs the original draft
+
+The first version of this document had several errors; the code and text above
+fix them:
+
+- The custom `User` was described as having a UUID pk but the model used
+  `BigAutoField`; `User.id` is now a real `UUIDField`.
+- Unverified login was described as `403` but the implementation raised
+  `AuthenticationFailed` (`401`), causing clients to refresh in a loop; it is now
+  a dedicated `403 email_not_verified`.
+- Logout returned `205 Reset Content`; it now returns `204 No Content`.
+- `seed_plans` mutated its module-level `PLANS` list when called more than once
+  in a process; it now copies the data and restores soft-deleted plans.
+- `MySubscriptionView` returned a different shape (`{"tier": "basic"}`) when no
+  row existed; it now always returns the full subscription shape.
+- `UserSerializer` exposed an awkward `date_joined_alias`; it now exposes
+  `created_at`.
+- Registration did not check uniqueness against soft-deleted rows, so a deleted
+  account's email/username caused a `500` at the DB constraint; both are now
+  validated against `all_objects`, with the race handled.
+- Plan changes/expiry did not handle expired trials or update `updated_at`;
+  services now handle both and keep history consistent.
+- Cookie deletion did not mirror the original cookie attributes; it now does.
+- Refresh did not reject soft-deleted/inactive users; it now returns
+  `user_inactive`.
+- Errors had no stable machine-readable code; every error now has one.

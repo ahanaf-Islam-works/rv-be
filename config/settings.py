@@ -11,6 +11,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import environ
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -24,9 +25,24 @@ env = environ.Env(
 # Real environment variables take precedence.
 environ.Env.read_env(BASE_DIR / ".env")
 
-SECRET_KEY = env("SECRET_KEY", default="django-insecure-dev-only-key")
 DEBUG = env("DEBUG")
+
+# Outside local development there is no insecure fallback: the process refuses
+# to boot without a real secret. Run with DEBUG=True for throwaway local work.
+SECRET_KEY = env(
+    "SECRET_KEY",
+    default="django-insecure-dev-only-key" if DEBUG else None,
+)
+if not SECRET_KEY:
+    raise ImproperlyConfigured(
+        "SECRET_KEY must be set when DEBUG=False (see .env.example)."
+    )
+
 ALLOWED_HOSTS = env("ALLOWED_HOSTS")
+
+# Dedicated key for signing JWTs (falls back to SECRET_KEY). Rotating this key
+# invalidates every outstanding access and refresh token.
+JWT_SIGNING_KEY = env("JWT_SIGNING_KEY", default=SECRET_KEY)
 
 
 INSTALLED_APPS = [
@@ -62,9 +78,14 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "anon": "100/hour",
         "user": "2000/hour",
-        "login": "5/min",
+        "login": "5/min",  # brute-force protection
         "register": "10/hour",
+        "email": "5/hour",  # verification / password-reset emails
+        "refresh": "60/hour",  # silent refresh + retry storms
     },
+    # Adds a stable machine-readable "code" to error bodies. The frontend
+    # branches on `code`, never on the human-readable `detail`.
+    "EXCEPTION_HANDLER": "config.exceptions.api_exception_handler",
 }
 
 
@@ -77,12 +98,32 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
     "UPDATE_LAST_LOGIN": True,
     "ALGORITHM": "HS256",
-    "SIGNING_KEY": SECRET_KEY,
+    "SIGNING_KEY": JWT_SIGNING_KEY,
     "AUTH_HEADER_TYPES": ("Bearer",),
     # Your User model uses a UUID primary key.
     "USER_ID_FIELD": "id",
     "USER_ID_CLAIM": "user_id",
+    "TOKEN_TYPE_CLAIM": "token_type",
 }
+
+
+# ---------------------------------------------------------------------------
+# Refresh token cookie (see auth-api.md)
+# ---------------------------------------------------------------------------
+AUTH_COOKIE_REFRESH = env("AUTH_COOKIE_REFRESH", default="refresh_token")
+AUTH_COOKIE_SECURE = env.bool("AUTH_COOKIE_SECURE", default=not DEBUG)
+AUTH_COOKIE_SAMESITE = env("AUTH_COOKIE_SAMESITE", default="Lax")
+# Only sent to the auth endpoints, never to the rest of the API.
+AUTH_COOKIE_PATH = env("AUTH_COOKIE_PATH", default="/api/v1/auth/")
+AUTH_COOKIE_MAX_AGE = int(SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"].total_seconds())
+
+
+# ---------------------------------------------------------------------------
+# Email verification / password reset
+# ---------------------------------------------------------------------------
+FRONTEND_URL = env("FRONTEND_URL", default="http://localhost:3000").rstrip("/")
+EMAIL_VERIFY_MAX_AGE = env.int("EMAIL_VERIFY_MAX_AGE", default=60 * 60 * 24)  # 24h
+PASSWORD_RESET_TIMEOUT = env.int("PASSWORD_RESET_TIMEOUT", default=60 * 60)  # 1h
 
 
 MIDDLEWARE = [
@@ -170,6 +211,26 @@ DEFAULT_FROM_EMAIL = env(
     "DEFAULT_FROM_EMAIL",
     default="webmaster@localhost",
 )
+
+
+# ---------------------------------------------------------------------------
+# Security defaults
+# ---------------------------------------------------------------------------
+if not DEBUG:
+    SECURE_SSL_REDIRECT = env.bool("SECURE_SSL_REDIRECT", default=True)
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = env.int("SECURE_HSTS_SECONDS", default=60 * 60 * 24 * 365)
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = env.bool(
+        "SECURE_HSTS_INCLUDE_SUBDOMAINS", default=True
+    )
+    SECURE_HSTS_PRELOAD = env.bool("SECURE_HSTS_PRELOAD", default=False)
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = "DENY"
+
+# Behind a reverse proxy that terminates TLS, set TRUST_PROXY_HEADERS=True.
+if env.bool("TRUST_PROXY_HEADERS", default=False):
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
 
 PROD_ENV = env.bool("PROD_ENV", default=not DEBUG)

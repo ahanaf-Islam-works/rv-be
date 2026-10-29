@@ -1,3 +1,5 @@
+import uuid
+
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.db import models
 from django.utils.translation import gettext_lazy as _
@@ -12,6 +14,14 @@ class User(
     AbstractBaseUser,
     PermissionsMixin,
 ):
+    # UUID primary keys avoid leaking user counts and make ids unguessable.
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+        verbose_name=_("ID"),
+    )
+
     username = models.CharField(
         max_length=150,
         unique=True,
@@ -21,6 +31,12 @@ class User(
     email = models.EmailField(
         unique=True,
         verbose_name=_("Email"),
+    )
+
+    email_verified_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        verbose_name=_("Email Verified At"),
     )
 
     first_name = models.CharField(
@@ -51,6 +67,15 @@ class User(
     EMAIL_FIELD = "email"
     REQUIRED_FIELDS = ["email"]
 
+    def save(self, *args, **kwargs):
+        # Keep emails/usernames normalised no matter which code path writes
+        # them (registration, admin forms, scripts).
+        if self.email:
+            self.email = self.email.strip().lower()
+        if self.username:
+            self.username = self.normalize_username(self.username)
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return self.username
 
@@ -59,6 +84,24 @@ class User(
 
     def get_short_name(self):
         return self.first_name or self.username
+
+    @property
+    def is_email_verified(self) -> bool:
+        return self.email_verified_at is not None
+
+    @property
+    def tier(self) -> str:
+        """Live plan tier, read from the database (never from the JWT claim)."""
+        from subscriptions.services import get_user_tier
+
+        return get_user_tier(self)
+
+    @property
+    def subscription(self):
+        """Current live subscription, or ``None``."""
+        from subscriptions.services import get_live_subscription
+
+        return get_live_subscription(self)
 
     class Meta:
         verbose_name = _("User")
