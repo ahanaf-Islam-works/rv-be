@@ -57,6 +57,7 @@ INSTALLED_APPS = [
     "rest_framework",
     "rest_framework_simplejwt",
     "rest_framework_simplejwt.token_blacklist",
+    "drf_spectacular",
     # Local apps
     "users",
     "subscriptions",
@@ -86,6 +87,28 @@ REST_FRAMEWORK = {
     # Adds a stable machine-readable "code" to error bodies. The frontend
     # branches on `code`, never on the human-readable `detail`.
     "EXCEPTION_HANDLER": "config.exceptions.api_exception_handler",
+    # OpenAPI schema generation (Swagger UI at /api-docs/).
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
+}
+
+
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Auth & Subscription API",
+    "DESCRIPTION": (
+        "JWT authentication (access token in memory + rotating refresh token in "
+        "an HttpOnly cookie) and Basic / Platinum / Diamond subscription tiers.\n\n"
+        "See `auth-api.md` in the repository for the frontend contract."
+    ),
+    "VERSION": "1.0.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    # Swagger UI cannot represent both request/response variants of the same
+    # serializer cleanly; split them into separate components.
+    "COMPONENT_SPLIT_REQUEST": True,
+    "SORT_OPERATIONS": False,
+    "SWAGGER_UI_SETTINGS": {
+        "persistAuthorization": True,
+        "displayRequestDuration": True,
+    },
 }
 
 

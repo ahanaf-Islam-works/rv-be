@@ -7,6 +7,9 @@ in `users/` (auth) and `subscriptions/` (plans/tiers). If something here disagre
 with the OpenAPI schema later, treat the schema as authoritative and open an
 issue.
 
+Interactive Swagger UI: `/api-docs/`  
+Raw OpenAPI schema: `/api/schema/` (YAML, or JSON with `Accept: application/json`)
+
 ---
 
 ## 1. TL;DR

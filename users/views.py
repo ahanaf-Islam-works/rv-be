@@ -3,6 +3,7 @@ import logging
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -10,6 +11,8 @@ from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+
+from config.schema import AccessTokenSerializer, ErrorSerializer, MessageSerializer
 
 from .cookies import delete_refresh_cookie, set_refresh_cookie
 from .serializers import (
@@ -33,6 +36,17 @@ logger = logging.getLogger("app.prod")
 User = get_user_model()
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Register a new account",
+        description=(
+            "Creates an unverified user and a free Basic subscription in one "
+            "transaction, then emails a verification link. No tokens are issued "
+            "until the email is verified."
+        ),
+    )
+)
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
@@ -40,6 +54,24 @@ class RegisterView(generics.CreateAPIView):
     throttle_scope = "register"
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Log in",
+        request=CustomTokenObtainPairSerializer,
+        responses={
+            200: AccessTokenSerializer,
+            401: ErrorSerializer,
+            403: ErrorSerializer,
+            429: ErrorSerializer,
+        },
+        description=(
+            "Returns a short-lived access token in the body and sets the "
+            "rotating refresh token in an HttpOnly cookie. Unverified users get "
+            "`403` with `code=email_not_verified`."
+        ),
+    )
+)
 class LoginView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
     throttle_scope = "login"
@@ -58,6 +90,23 @@ class LoginView(TokenObtainPairView):
         return response
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Refresh the access token",
+        request=None,
+        responses={
+            200: AccessTokenSerializer,
+            401: ErrorSerializer,
+            429: ErrorSerializer,
+        },
+        description=(
+            "Reads the refresh token from the HttpOnly cookie (no request body), "
+            "blacklists it, and returns a new access token plus a rotated refresh "
+            "cookie."
+        ),
+    )
+)
 class CookieTokenRefreshView(TokenRefreshView):
     serializer_class = CookieTokenRefreshSerializer
     throttle_scope = "refresh"
@@ -71,6 +120,18 @@ class CookieTokenRefreshView(TokenRefreshView):
         return response
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Log out",
+        request=None,
+        responses={204: None},
+        description=(
+            "Blacklists the refresh token from the cookie and clears the cookie. "
+            "Works without an access token, so it still succeeds after expiry."
+        ),
+    )
+)
 class LogoutView(APIView):
     """Works even if the access token already expired, so it needs no auth."""
 
@@ -90,6 +151,13 @@ class LogoutView(APIView):
         return response
 
 
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Auth"],
+        summary="Current user",
+        description="Profile plus the live plan tier read from the database.",
+    )
+)
 class MeView(generics.RetrieveAPIView):
     serializer_class = UserSerializer
     permission_classes = [IsAuthenticated]
@@ -98,6 +166,23 @@ class MeView(generics.RetrieveAPIView):
         return self.request.user
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Change password",
+        request=ChangePasswordSerializer,
+        responses={
+            200: MessageSerializer,
+            400: ErrorSerializer,
+            401: ErrorSerializer,
+        },
+        description=(
+            "Requires the old password. Revokes every outstanding refresh token "
+            "for the user and clears the refresh cookie; the access token still "
+            "expires on its own within 15 minutes."
+        ),
+    )
+)
 class ChangePasswordView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -123,6 +208,15 @@ class _PublicEmailView(APIView):
     throttle_scope = "email"
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Verify email",
+        request=VerifyEmailSerializer,
+        responses={200: MessageSerializer, 400: ErrorSerializer, 429: ErrorSerializer},
+        description="Consumes the signed token from the verification link.",
+    )
+)
 class VerifyEmailView(_PublicEmailView):
     def post(self, request):
         ser = VerifyEmailSerializer(data=request.data)
@@ -135,6 +229,18 @@ class VerifyEmailView(_PublicEmailView):
         return Response({"detail": "Email verified. You can now log in."})
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Resend verification email",
+        request=EmailOnlySerializer,
+        responses={200: MessageSerializer, 400: ErrorSerializer, 429: ErrorSerializer},
+        description=(
+            "Always returns the same response, whether or not the account "
+            "exists (no user enumeration)."
+        ),
+    )
+)
 class ResendVerificationView(_PublicEmailView):
     def post(self, request):
         ser = EmailOnlySerializer(data=request.data)
@@ -142,7 +248,7 @@ class ResendVerificationView(_PublicEmailView):
         user = User.objects.filter(
             email__iexact=ser.validated_data["email"], is_active=True
         ).first()
-        if user and not user.is_email_verified:
+        if user and not getattr(user, "email_verified_at", None):
             send_verification_email(user)
         # Identical response whether or not the account exists (no enumeration).
         return Response(
@@ -150,6 +256,18 @@ class ResendVerificationView(_PublicEmailView):
         )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Request a password reset",
+        request=EmailOnlySerializer,
+        responses={200: MessageSerializer, 400: ErrorSerializer, 429: ErrorSerializer},
+        description=(
+            "Emails a single-use reset link (valid 1 hour). The response is "
+            "identical for unknown addresses."
+        ),
+    )
+)
 class PasswordResetRequestView(_PublicEmailView):
     def post(self, request):
         ser = EmailOnlySerializer(data=request.data)
@@ -164,6 +282,18 @@ class PasswordResetRequestView(_PublicEmailView):
         )
 
 
+@extend_schema_view(
+    post=extend_schema(
+        tags=["Auth"],
+        summary="Reset password with a link token",
+        request=PasswordResetConfirmSerializer,
+        responses={200: MessageSerializer, 400: ErrorSerializer, 429: ErrorSerializer},
+        description=(
+            "Sets the new password, marks the email verified, and revokes every "
+            "refresh token for the user. The reset token is single-use."
+        ),
+    )
+)
 class PasswordResetConfirmView(_PublicEmailView):
     def post(self, request):
         ser = PasswordResetConfirmSerializer(data=request.data)

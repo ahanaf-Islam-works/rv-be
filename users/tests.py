@@ -186,7 +186,6 @@ class TokenLifecycleTests(AuthTestCase):
         self.assertIsNotNone(self.client.cookies.get(settings.AUTH_COOKIE_REFRESH))
 
     def test_me_requires_auth(self):
-        self.client.credentials()
         self.client.cookies.clear()
 
         response = self.client.get(ME_URL)
@@ -195,9 +194,10 @@ class TokenLifecycleTests(AuthTestCase):
 
     def test_me_returns_db_backed_tier(self):
         login = self.login()
-        self.client.credentials(HTTP_AUTHORIZATION=f"Bearer {login.json()['access']}")
 
-        response = self.client.get(ME_URL)
+        response = self.client.get(
+            ME_URL, HTTP_AUTHORIZATION=f"Bearer {login.json()['access']}"
+        )
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.json()["tier"], Tier.BASIC)
@@ -280,6 +280,25 @@ class TokenLifecycleTests(AuthTestCase):
         self.client.cookies.clear()
         self.assertEqual(self.login().status_code, 401)
         self.assertEqual(self.login(password=NEW_PASSWORD).status_code, 200)
+
+
+class ApiDocsTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+
+    def test_swagger_ui_is_public(self):
+        response = self.client.get("/api-docs/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "swagger-ui")
+
+    def test_openapi_schema_is_public(self):
+        response = self.client.get("/api/schema/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response["Content-Type"].split(";")[0], "application/vnd.oai.openapi"
+        )
 
 
 class PasswordResetTests(AuthTestCase):

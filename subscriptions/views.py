@@ -1,5 +1,8 @@
+from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+from config.schema import ErrorSerializer, MessageSerializer
 
 from .models import BillingCycle, Plan, SubscriptionStatus, Tier
 from .permissions import IsDiamond, IsPlatinumOrHigher
@@ -7,6 +10,14 @@ from .serializers import PlanSerializer, SubscriptionSerializer
 from .services import get_live_subscription
 
 
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Subscriptions"],
+        summary="List plan catalog",
+        responses=PlanSerializer(many=True),
+        description="Public pricing catalog, sorted by monthly price.",
+    )
+)
 class PlanListView(APIView):
     """Public pricing catalog."""
 
@@ -18,6 +29,17 @@ class PlanListView(APIView):
         return Response(PlanSerializer(plans, many=True).data)
 
 
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Subscriptions"],
+        summary="Current subscription",
+        responses={200: SubscriptionSerializer, 401: ErrorSerializer},
+        description=(
+            "The caller's live subscription, limits included. The tier is read "
+            "from the database, so it is fresh after a plan change."
+        ),
+    )
+)
 class MySubscriptionView(APIView):
     """The caller's live subscription. The tier here is always DB-fresh."""
 
@@ -44,6 +66,13 @@ class MySubscriptionView(APIView):
 
 
 # --- Example gated endpoints -------------------------------------------------
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Subscriptions"],
+        summary="Platinum+ demo feature",
+        responses={200: MessageSerializer, 401: ErrorSerializer, 403: ErrorSerializer},
+    )
+)
 class PlatinumFeatureView(APIView):
     permission_classes = [IsPlatinumOrHigher]
 
@@ -51,6 +80,13 @@ class PlatinumFeatureView(APIView):
         return Response({"detail": "Platinum+ feature unlocked."})
 
 
+@extend_schema_view(
+    get=extend_schema(
+        tags=["Subscriptions"],
+        summary="Diamond-only demo feature",
+        responses={200: MessageSerializer, 401: ErrorSerializer, 403: ErrorSerializer},
+    )
+)
 class DiamondFeatureView(APIView):
     permission_classes = [IsDiamond]
 
